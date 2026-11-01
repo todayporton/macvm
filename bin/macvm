@@ -1,0 +1,569 @@
+#!/bin/bash
+# macvm - run macOS GUI tests inside one shared Tart VM, so the host's mouse,
+# keyboard and window focus are never touched. See `macvm help`.
+#
+# Everything GUI-related runs in the guest through `tart exec` (the guest agent
+# lives in the logged-in Aqua session). File transfer uses SSH with a dedicated key.
+
+set -uo pipefail
+
+VM=${MACVM_NAME:-macos-test}
+IMAGE=${MACVM_IMAGE:-ghcr.io/cirruslabs/macos-tahoe-base:latest}
+VM_CPU=${MACVM_CPU:-4}
+VM_MEMORY=${MACVM_MEMORY:-8192}
+VM_DISPLAY=${MACVM_DISPLAY:-1440x900}
+LEASE_TTL=${MACVM_LOCK_TTL:-900}     # A lease expires this many idle seconds after its last use.
+LEASE_WAIT=${MACVM_LOCK_WAIT:-300}   # How long a command waits for another session's lease.
+
+VERSION=0.1.0
+TART_REPO=openai/tart
+TART_TEAM_ID=9M2P8L4D89   # Developer ID team that signs official Tart releases.
+
+# Per-user data, never kept in the install prefix, so upgrades cannot lose it.
+STATE=${MACVM_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/macvm}
+SSH_KEY="$STATE/ssh/id_ed25519"
+KNOWN_HOSTS="$STATE/known_hosts"
+LEASE_FILE="$STATE/lease"
+RUN_LOG="$STATE/tart-run.log"
+
+GUEST_USER=admin
+GUEST_HOME=/Users/admin
+GUEST_ROOT="$GUEST_HOME/macvm"
+GUEST_HELPER="$GUEST_ROOT/bin/macvm-helper"
+
+EX_LOCKED=75
+
+mkdir -p "$STATE" "$STATE/screenshots" "$STATE/results"
+
+case "$0" in
+  /*) SELF=$0 ;;
+  *) SELF="$PWD/$0" ;;
+esac
+# Follow symlinks (Homebrew links bin/macvm into its Cellar with a relative path).
+while [ -L "$SELF" ]; do
+  link=$(readlink "$SELF")
+  case "$link" in
+    /*) SELF=$link ;;
+    *) SELF="$(dirname "$SELF")/$link" ;;
+  esac
+done
+SELF="$(cd "$(dirname "$SELF")" && pwd)/$(basename "$SELF")"
+PREFIX=$(dirname "$(dirname "$SELF")")
+# Installed layout: PREFIX/share/macvm. Source checkout: REPO/build and REPO/skill.
+if [ -d "$PREFIX/share/macvm" ]; then
+  HELPER_SRC=${MACVM_HELPER:-$PREFIX/share/macvm/macvm-helper}
+  SKILL_SRC="$PREFIX/share/macvm/skill/claude/SKILL.md"
+  LIB="$PREFIX/share/macvm/lib"
+else
+  HELPER_SRC=${MACVM_HELPER:-$PREFIX/build/macvm-helper}
+  SKILL_SRC="$PREFIX/skill/claude/SKILL.md"
+  LIB="$PREFIX/lib"
+fi
+
+err() { printf 'macvm: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+sq() { local s=${1//\'/\'\\\'\'}; printf "'%s'" "$s"; }
+
+find_tart() {
+  local candidate
+  for candidate in "$(command -v tart 2>/dev/null)" "$HOME/.local/bin/tart" /opt/homebrew/bin/tart; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+TART=$(find_tart || true)
+TART_HOME_DIR=${TART_HOME:-$HOME/.tart}
+
+# Installs the latest official release for this user only. Nothing runs until the
+# published checksum, the code signature and Apple's notarization have all passed.
+install_tart() {
+  local base=${MACVM_TART_INSTALL_DIR:-$HOME/.local} version sums want got app
+  [ "$(uname -m)" = arm64 ] || die "Tart requires Apple Silicon"
+  tmp=$(/usr/bin/mktemp -d) || die "mktemp failed"
+  trap 'rm -rf "$tmp"' EXIT
+  version=$(curl -fsSL "https://api.github.com/repos/$TART_REPO/releases/latest" | jq -r .tag_name)
+  [ -n "$version" ] && [ "$version" != null ] || die "could not determine the latest Tart release"
+  case "$version" in *[!A-Za-z0-9._-]*) die "unexpected Tart version: $version" ;; esac
+  info "installing Tart $version from github.com/$TART_REPO..."
+  local url="https://github.com/$TART_REPO/releases/download/$version"
+  curl -fsSL -o "$tmp/tart.tar.gz" "$url/tart.tar.gz" || die "Tart download failed"
+  sums=$(curl -fsSL "$url/tart_${version}_checksums.txt") || die "Tart checksum download failed"
+  want=$(printf '%s\n' "$sums" | awk '$2 == "tart.tar.gz" {print $1}')
+  got=$(shasum -a 256 "$tmp/tart.tar.gz" | cut -d' ' -f1)
+  [ -n "$want" ] && [ "$want" = "$got" ] || die "Tart checksum mismatch; not installing"
+  mkdir "$tmp/x" && /usr/bin/tar -xzf "$tmp/tart.tar.gz" -C "$tmp/x" || die "could not unpack Tart"
+  app="$tmp/x/tart.app"
+  /usr/bin/codesign --verify --deep --strict "$app" 2>/dev/null || die "Tart signature is invalid; not installing"
+  /usr/bin/codesign -dv "$app" 2>&1 | grep -x "TeamIdentifier=$TART_TEAM_ID" >/dev/null || die "Tart is signed by an unexpected team; not installing"
+  /usr/sbin/spctl -a -t exec "$app" 2>/dev/null || die "Tart failed the notarization check; not installing"
+  local dest="$base/opt/tart/$version"
+  rm -rf "$dest"; mkdir -p "$dest" "$base/bin"
+  cp -R "$app" "$tmp/x/LICENSE" "$dest/" || die "could not copy Tart to $dest"
+  # Tart must run from inside its bundle for its provisioning profile to apply.
+  printf '#!/bin/sh\nexec "%s/tart.app/Contents/MacOS/tart" "$@"\n' "$dest" > "$base/bin/tart"
+  chmod 755 "$base/bin/tart"
+  TART="$base/bin/tart"
+  info "installed $("$TART" --version) at $dest"
+}
+
+valid_id() {
+  case "$1" in
+    ''|.*|*[!A-Za-z0-9._-]*) die "invalid app id: '$1'" ;;
+  esac
+}
+
+# --- VM state ---------------------------------------------------------------
+
+vm_exists() { "$TART" list --source local --format json 2>/dev/null | jq -e --arg n "$VM" 'any(.[]; .Name == $n)' >/dev/null; }
+vm_running() { "$TART" list --source local --format json 2>/dev/null | jq -e --arg n "$VM" 'any(.[]; .Name == $n and .Running)' >/dev/null; }
+vm_ip() { "$TART" ip "$VM" --wait "${1:-0}" 2>/dev/null; }
+
+require_running() {
+  vm_running || die "VM '$VM' is not running; run: macvm start"
+}
+
+# Runs in the guest's GUI session, without a shell, so arguments need no quoting.
+gui() { "$TART" exec "$VM" "$@"; }
+helper() { gui "$GUEST_HELPER" "$@"; }
+
+SSH_OPTS=(-F /dev/null -i "$SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes
+  -o "UserKnownHostsFile=$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new
+  -o "HostKeyAlias=$VM" -o ConnectTimeout=5 -o LogLevel=ERROR)
+
+# Runs a shell string in the guest over SSH.
+gssh() {
+  local ip
+  ip=$(vm_ip) || die "could not resolve the VM's IP"
+  ssh "${SSH_OPTS[@]}" "$GUEST_USER@$ip" "$@"
+}
+
+guest_shell() { gui /bin/sh -c "$1"; }
+
+wait_until() { # seconds description command...
+  local deadline=$(( $(date +%s) + $1 )) what=$2
+  shift 2
+  until "$@" >/dev/null 2>&1; do
+    [ "$(date +%s)" -lt "$deadline" ] || { err "timed out waiting for $what"; return 1; }
+    sleep 2
+  done
+}
+
+boot_vm() {
+  # A kernel lock so two sessions starting at once do not launch the VM twice;
+  # the kernel drops it if this process dies.
+  /usr/bin/lockf -k -t 300 "$STATE/start.mutex" "$SELF" __boot || exit 1
+}
+
+cmd_boot() {
+  vm_exists || die "VM '$VM' does not exist; run: macvm setup"
+  if ! vm_running; then
+    info "starting VM '$VM' (headless)..."
+    # setsid-detached: the VM must outlive the shell that started it. No window,
+    # no audio, no clipboard or USB sharing, and no directories shared.
+    /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or die "exec: $!"' \
+      "$TART" run "$VM" --no-graphics --no-audio --no-clipboard --no-usb-accessories \
+      >>"$RUN_LOG" 2>&1 </dev/null &
+    disown
+  fi
+  wait_until 180 "the VM to get an IP" vm_ip || exit 1
+  wait_until 180 "the guest agent" gui /usr/bin/true || exit 1
+}
+
+gui_ready() {
+  [ "$(gui /bin/sh -c 'pgrep -xq Finder && pgrep -xq Dock && echo yes')" = yes ]
+}
+
+cmd_start() {
+  boot_vm
+  wait_until 120 "the desktop" gui_ready || exit 1
+  [ -f "$SSH_KEY" ] || die "the SSH key is missing; run: macvm setup"
+  wait_until 60 "SSH" gssh true || die "SSH is not reachable; run: macvm setup"
+  push_helper
+  info "VM '$VM' is running at $(vm_ip)"
+}
+
+ensure_started() { vm_running || cmd_start; }
+
+# --- Lease: one GUI session at a time ----------------------------------------
+#
+# Each CLI call is a separate process, so the lease is a file naming its owner.
+# All reads and writes happen under lockf(1), a kernel lock that cannot go stale.
+# A lease is reclaimable when it expires (idle TTL) or its owner process is dead,
+# so a crashed session never blocks others permanently.
+
+lease_owner() {
+  if [ -n "${MACVM_SESSION:-}" ]; then
+    OWNER=$MACVM_SESSION; OWNER_PID=${MACVM_SESSION_PID:-}
+    return 0
+  fi
+  # No explicit session: the owner is the nearest long-lived ancestor. Shells that
+  # run a command or script are transient (agents spawn one per tool call) and are
+  # skipped, which stops at an interactive shell or at the agent process itself.
+  local pid=$PPID line parent cmd first rest
+  while [ "$pid" -gt 1 ]; do
+    line=$(ps -o ppid=,command= -p "$pid" 2>/dev/null) || break
+    read -r parent cmd <<<"$line"
+    first=${cmd%% *}; rest=""
+    [ "$first" = "$cmd" ] || rest=${cmd#* }
+    case "$(basename -- "${first#-}")" in
+      sh|bash|zsh|dash|ksh|fish|lockf|env|make)
+        case "$rest" in
+          ''|-l|-i|--login) break ;;
+        esac
+        ;;
+      *) break ;;
+    esac
+    pid=$parent
+  done
+  OWNER=pid-$pid; OWNER_PID=$pid
+}
+
+lease_field() { /usr/bin/sed -n "s/^$1=//p" "$LEASE_FILE" 2>/dev/null | head -1; }
+
+lease_live() {
+  [ -f "$LEASE_FILE" ] || return 1
+  local expires pid
+  expires=$(lease_field expires); pid=$(lease_field pid)
+  [ "${expires:-0}" -gt "$(date +%s)" ] || return 1
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then return 1; fi
+  return 0
+}
+
+lease_holder_text() {
+  printf "owner=%s since=%s cwd=%s expires_in=%ss" "$(lease_field owner)" "$(lease_field since)" \
+    "$(lease_field cwd)" "$(( $(lease_field expires) - $(date +%s) ))"
+}
+
+# Called under the lock. Exit 0 = held by us now, 1 = held by someone else.
+cmd_lease_try() {
+  local ttl=$1 since tmp
+  lease_owner
+  since=$(date '+%Y-%m-%dT%H:%M:%S')
+  if lease_live; then
+    if [ "$(lease_field owner)" != "$OWNER" ]; then
+      lease_holder_text; return 1
+    fi
+    since=$(lease_field since)
+  fi
+  tmp=$(/usr/bin/mktemp "$STATE/lease.XXXXXX")
+  { printf 'owner=%s\npid=%s\nsince=%s\nexpires=%s\ncwd=%s\n' \
+      "$OWNER" "$OWNER_PID" "$since" "$(( $(date +%s) + ttl ))" "$PWD"; } > "$tmp"
+  mv -f "$tmp" "$LEASE_FILE"
+}
+
+cmd_lease_release() {
+  local force=$1
+  lease_owner
+  [ -f "$LEASE_FILE" ] || return 0
+  if ! lease_live || [ "$(lease_field owner)" = "$OWNER" ] || [ "$force" = force ]; then
+    rm -f "$LEASE_FILE"; return 0
+  fi
+  lease_holder_text; return 1
+}
+
+locked() { /usr/bin/lockf -k -t 30 "$STATE/lease.mutex" "$SELF" "$@"; }
+
+acquire_lease() { # [ttl] [wait]
+  local ttl=${1:-$LEASE_TTL} wait=${2:-$LEASE_WAIT} deadline holder announced=
+  deadline=$(( $(date +%s) + wait ))
+  while :; do
+    if holder=$(locked __lease_try "$ttl"); then return 0; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      err "another session holds the GUI lock: $holder"
+      err "gave up after ${wait}s. Retry later; only if that session is known to be gone: macvm unlock --force"
+      exit "$EX_LOCKED"
+    fi
+    [ -n "$announced" ] || { info "waiting for the GUI lock: $holder"; announced=1; }
+    sleep 3
+  done
+}
+
+cmd_lock() {
+  local ttl=$LEASE_TTL wait=$LEASE_WAIT
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ttl) ttl=${2:?}; shift 2 ;;
+      --wait) wait=${2:?}; shift 2 ;;
+      *) die "usage: macvm lock [--ttl SECONDS] [--wait SECONDS]" ;;
+    esac
+  done
+  acquire_lease "$ttl" "$wait"
+  echo "lock held: $(lease_holder_text)"
+}
+
+cmd_unlock() {
+  local mode=own out
+  [ "${1:-}" = --force ] && mode=force
+  if ! out=$(locked __lease_release "$mode"); then
+    die "the lock belongs to another session ($out); use --force only if it is gone"
+  fi
+  echo "lock released"
+}
+
+cmd_lock_status() {
+  if lease_live; then echo "locked: $(lease_holder_text)"; else echo "free"; fi
+}
+
+# --- Setup --------------------------------------------------------------------
+
+cmd_setup() {
+  local integrate=auto
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-integrations) integrate=no; shift ;;
+      *) die "usage: macvm setup [--no-integrations]" ;;
+    esac
+  done
+  [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ] || die "macvm requires an Apple Silicon Mac"
+  command -v jq >/dev/null || die "jq is required (bundled with macOS 15+, or: brew install jq)"
+  [ -x "$HELPER_SRC" ] || die "$HELPER_SRC is missing; build it with: make"
+  [ -n "$TART" ] || install_tart
+  acquire_lease
+
+  if vm_exists; then
+    info "VM '$VM' already exists; reusing it"
+  else
+    info "cloning $IMAGE to '$VM' (first run downloads about 26 GB)..."
+    "$TART" clone "$IMAGE" "$VM" || die "tart clone failed"
+    "$TART" set "$VM" --cpu "$VM_CPU" --memory "$VM_MEMORY" --display "$VM_DISPLAY" || die "tart set failed"
+  fi
+
+  if [ ! -f "$SSH_KEY" ]; then
+    mkdir -p "$(dirname "$SSH_KEY")"; chmod 700 "$(dirname "$SSH_KEY")"
+    ssh-keygen -q -t ed25519 -N '' -C "macvm@$(hostname -s)" -f "$SSH_KEY" || die "ssh-keygen failed"
+  fi
+
+  boot_vm
+  wait_until 120 "the desktop" gui_ready || exit 1
+
+  info "authorizing the dedicated SSH key and disabling SSH password login..."
+  # The key travels through the guest agent, so no password ever needs to be scripted.
+  guest_shell "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qxF $(sq "$(cat "$SSH_KEY.pub")") ~/.ssh/authorized_keys || echo $(sq "$(cat "$SSH_KEY.pub")") >> ~/.ssh/authorized_keys" \
+    || die "could not install the SSH key"
+  guest_shell "printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sudo -n tee /etc/ssh/sshd_config.d/100-macvm.conf >/dev/null" \
+    || die "could not write the sshd drop-in"
+  wait_until 60 "SSH" gssh true || exit 1
+
+  push_helper
+
+  info "tuning the guest (no sleep, no indexing, no automatic updates)..."
+  guest_shell 'sudo -n pmset -a sleep 0 displaysleep 0 disksleep 0; sudo -n mdutil -a -i off >/dev/null; sudo -n softwareupdate --schedule off >/dev/null 2>&1; defaults write com.apple.Terminal NSQuitAlwaysKeepsWindows -bool false; osascript -e "tell application id \"com.apple.Terminal\" to quit" >/dev/null 2>&1; mkdir -p ~/macvm/apps ~/macvm/runs ~/macvm/bin; true'
+
+  local w=${VM_DISPLAY%x*} h=${VM_DISPLAY#*x}
+  helper set-display "$w" "$h" >/dev/null || err "warning: could not set the guest display to $VM_DISPLAY"
+
+  local perms
+  perms=$(helper permissions) || die "helper failed in the VM"
+  echo "$perms" | jq -e '.accessibility and .screenCapture' >/dev/null \
+    || die "TCC permissions are incomplete in the VM: $perms"
+  echo "setup complete. permissions: $perms"
+  cmd_status
+
+  # Agent integrations are additive and only apply where that agent is present.
+  if [ "$integrate" = auto ] && [ -d "$HOME/.claude" ]; then
+    cmd_integrate claude
+  fi
+}
+
+# Copies the helper only when it differs, so upgrading macvm also upgrades the VM.
+push_helper() {
+  [ -x "$HELPER_SRC" ] || { err "warning: $HELPER_SRC is missing"; return 0; }
+  local want have
+  want=$(shasum -a 256 "$HELPER_SRC" | cut -d' ' -f1)
+  have=$(gssh "shasum -a 256 $(sq "$GUEST_HELPER") 2>/dev/null | cut -d' ' -f1") || die "ssh failed"
+  [ "$want" = "$have" ] && return 0
+  info "updating the helper in the VM"
+  gssh "mkdir -p $(sq "$GUEST_ROOT/bin")" || die "ssh failed"
+  scp -q "${SSH_OPTS[@]}" "$HELPER_SRC" "$GUEST_USER@[$(vm_ip)]:$GUEST_HELPER" || die "could not copy the helper"
+}
+
+# Removes per-user data. The VM is deleted only when explicitly requested.
+cmd_teardown() {
+  local delete_vm=no yes=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delete-vm) delete_vm=yes; shift ;;
+      --yes) yes=yes; shift ;;
+      *) die "usage: macvm teardown [--delete-vm] --yes" ;;
+    esac
+  done
+  if [ "$yes" != yes ]; then
+    echo "This removes the Claude Code integration and $STATE (SSH key, screenshots, results)."
+    [ "$delete_vm" = yes ] && echo "It also DELETES the VM '$VM' and everything inside it."
+    echo "Re-run with --yes to proceed. Tart and the macvm program stay installed."
+    return 1
+  fi
+  if [ -n "$TART" ] && vm_exists; then
+    if [ "$delete_vm" = yes ]; then
+      acquire_lease
+      vm_running && cmd_stop
+      "$TART" delete "$VM" || die "tart delete failed"
+      echo "deleted VM '$VM'"
+    else
+      # Without the key this VM is unreachable by SSH until `macvm setup` re-keys it.
+      echo "keeping VM '$VM'"
+    fi
+  fi
+  cmd_integrate claude --remove
+  rm -rf "$STATE"
+  echo "removed $STATE"
+}
+
+# --- Lifecycle ----------------------------------------------------------------
+
+cmd_stop() {
+  if ! vm_running; then echo "VM '$VM' is already stopped"; return 0; fi
+  acquire_lease "$LEASE_TTL" "${MACVM_LOCK_WAIT:-30}"
+  info "shutting down the guest..."
+  gssh 'sudo -n shutdown -h now' >/dev/null 2>&1 || true
+  if ! wait_until 60 "guest shutdown" sh -c "! '$SELF' __is_running"; then
+    info "forcing the VM to stop"
+    "$TART" stop "$VM" --timeout 30 || die "tart stop failed"
+  fi
+  locked __lease_release own >/dev/null || true
+  echo "VM '$VM' stopped"
+}
+
+cmd_status() {
+  local running=no
+  vm_exists || { echo "vm: '$VM' does not exist (run: macvm setup)"; return 0; }
+  vm_running && running=yes
+  "$TART" list --source local --format json | jq -r --arg n "$VM" \
+    '.[] | select(.Name == $n) | "vm: \(.Name)  running: \(.Running)  disk: \(.Disk) GB  allocated: \(.Size) GB"'
+  "$TART" get "$VM" --format json | jq -r '"os: \(.OS)  cpu: \(.CPU)  memory: \(.Memory) MB  display: \(.Display)"'
+  echo "on-disk: $(du -sh "$TART_HOME_DIR/vms/$VM" 2>/dev/null | cut -f1)"
+  echo "lock: $(cmd_lock_status)"
+  if [ "$running" = yes ]; then
+    echo "ip: $(vm_ip)"
+    echo "ssh: $(gssh true >/dev/null 2>&1 && echo ok || echo FAILED)"
+    echo "agent: $(gui /usr/bin/true >/dev/null 2>&1 && echo ok || echo FAILED)"
+    echo "permissions: $(helper permissions 2>&1)"
+    echo "frontmost: $(helper frontmost 2>&1)"
+    echo "guest-disk: $(gssh "df -h / | tail -1 | awk '{print \$3\" used, \"\$4\" free\"}'" 2>/dev/null)"
+  fi
+}
+
+cmd_ssh() {
+  require_running
+  local ip
+  ip=$(vm_ip) || die "no IP"
+  if [ $# -gt 0 ]; then exec ssh "${SSH_OPTS[@]}" "$GUEST_USER@$ip" "$@"; fi
+  exec ssh -t "${SSH_OPTS[@]}" -o BatchMode=no "$GUEST_USER@$ip"
+}
+
+# Opens the desktop on request only. This necessarily shows a window on the host,
+# so nothing in the test flow calls it, and without --open it only prints the URL.
+cmd_view() {
+  require_running
+  guest_shell 'sudo -n launchctl enable system/com.apple.screensharing && sudo -n launchctl kickstart system/com.apple.screensharing' >/dev/null 2>&1 \
+    || guest_shell 'sudo -n launchctl bootstrap system /System/Library/LaunchDaemons/com.apple.screensharing.plist' >/dev/null 2>&1 || true
+  local url="vnc://$GUEST_USER@$(vm_ip)"
+  echo "$url  (password: admin)"
+  [ "${1:-}" = --open ] && /usr/bin/open "$url"
+  return 0
+}
+
+usage() {
+  cat <<'USAGE'
+macvm - macOS GUI testing inside one shared Tart VM (the host GUI is never touched)
+
+VM      setup [--no-integrations] | start | stop | status | ssh [CMD] | view [--open]
+        integrate claude [--remove] | teardown [--delete-vm] --yes | version
+APPS    install PATH [--adhoc-sign]          .app bundle or executable
+        launch ID [--timeout S] [--env K=V]... [-- ARGS...]
+        quit ID [--force] | app-status BUNDLE_ID | apps | frontmost
+WINDOWS windows [BUNDLE_ID] | activate BUNDLE_ID [TITLE] | screen
+INPUT   click X Y | doubleclick X Y | rightclick X Y | move X Y
+        drag X1 Y1 X2 Y2 [--duration MS]
+        scroll DY [DX] [--at X,Y]            positive DY scrolls down
+        key COMBO...                         e.g. cmd+a return shift+tab
+        type TEXT
+WAIT    wait SECONDS | wait-window BUNDLE_ID [TIMEOUT]
+UI      ui elements [--app ID] [--query Q] [--all]   controls in reach, one JSON per line
+        ui tree [--app ID] [--depth N] [--menu] [--all]   full hierarchy
+        ui text [--app ID]                       window text in reading order
+        ui find SELECTOR
+        ui click SELECTOR [--press] [--double] [--right] [--force]
+        ui type SELECTOR TEXT [--replace] [--set]
+        ui focus SELECTOR | ui menu MENU [SUBMENU...] ITEM
+        ui wait SELECTOR [--gone] [--timeout S]
+        SELECTOR: --label L --id I --role R --value V --path P [--app ID] [--index N] [--all]
+        Without --app, the frontmost app.
+MCP     mcp                                   the same operations as an MCP server on stdio
+OUTPUT  screenshot [-o FILE] [--window ID] [--region X,Y,W,H] [--raw]
+        logs ID [--stdout|--stderr] [--tail N] | crashes ID
+        collect ID [-o DIR] [--since 30m]
+        clean ID | --all | --host
+LOCK    lock [--ttl S] [--wait S] | unlock [--force] | lock-status
+
+ID is the bundle id for an app, or the file name for a plain executable.
+GUI commands take a per-session lock automatically. Prefer `ui` commands, and use
+coordinates when an app exposes no accessible element. Coordinates are in points,
+and `ui` frames and full-screen screenshots share that coordinate space.
+Exit codes: 3 not found, 4 no TCC permission, 6 element disabled, 7 element covered,
+8 selector ambiguous, 75 another session held the lock for the whole wait.
+USAGE
+}
+
+for module in apps gui integrations mcp; do
+  # shellcheck disable=SC1090
+  . "$LIB/$module.sh" || exit 1
+done
+
+main() {
+  local command=${1:-help}
+  [ $# -gt 0 ] && shift
+  case "$command" in
+    setup|integrate|teardown|help|-h|--help|version|--version|__install_tart|__lease_*|lock-status|unlock) ;;
+    *) [ -n "$TART" ] || die "tart not found; run: macvm setup" ;;
+  esac
+  case "$command" in
+    version|--version) echo "macvm $VERSION" ;;
+    integrate) cmd_integrate "$@" ;;
+    teardown) cmd_teardown "$@" ;;
+    __install_tart) install_tart ;;
+    __boot) cmd_boot ;;
+    __is_running) vm_running ;;
+    __lease_try) cmd_lease_try "$@" ;;
+    __lease_release) cmd_lease_release "$@" ;;
+
+    setup) cmd_setup "$@" ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    status) cmd_status ;;
+    ssh) cmd_ssh "$@" ;;
+    view) cmd_view "$@" ;;
+
+    install) cmd_install "$@" ;;
+    launch) cmd_launch "$@" ;;
+    quit) cmd_quit "$@" ;;
+    app-status|apps|frontmost|windows|screen) require_running; helper "$command" "$@" ;;
+    activate) gui_cmd activate "$@" ;;
+
+    click) gui_cmd click "$@" ;;
+    doubleclick) gui_cmd click "$@" --count 2 ;;
+    rightclick) gui_cmd click "$@" --button right ;;
+    move|drag|scroll|key|type) gui_cmd "$command" "$@" ;;
+    ui) cmd_ui "$@" ;;
+    mcp) cmd_mcp ;;
+
+    wait) cmd_wait "$@" ;;
+    wait-window) cmd_wait_window "$@" ;;
+
+    screenshot) cmd_screenshot "$@" ;;
+    logs) cmd_logs "$@" ;;
+    crashes) cmd_crashes "$@" ;;
+    collect) cmd_collect "$@" ;;
+    clean) cmd_clean "$@" ;;
+
+    lock) cmd_lock "$@" ;;
+    unlock) cmd_unlock "$@" ;;
+    lock-status) cmd_lock_status ;;
+
+    help|-h|--help) usage ;;
+    *) err "unknown command: $command"; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
