@@ -37,7 +37,7 @@ macvm setup
 1. Installs Tart if it is missing, into `~/.local/opt/tart`. The release must match its published checksum, be signed by the expected team, and pass Apple's notarization check.
 2. Creates the VM `macos-test` from `macos-tahoe-base`, or reuses it if it exists. Other VMs are left alone.
 3. Creates a dedicated SSH key, authorizes it, and disables SSH password login in the guest.
-4. Copies the guest helper in, turns off guest sleep, indexing and automatic updates, and checks TCC permissions.
+4. Copies the guest helper in, turns off guest sleep and indexing, and checks TCC permissions.
 5. If `~/.claude` exists, runs `macvm integrate claude`. Skip this with `--no-integrations`.
 
 ## Update and uninstall
@@ -55,7 +55,7 @@ Teardown only removes what macvm owns: its state directory, its skill (identifie
 
 ## Commands
 
-Run `macvm help` for the full list. ID is the bundle id, or the file name for a plain executable.
+Run `macvm help` for the full list. ID is the bundle id, or the file name for an executable with no bundle, such as `swift build` output. Wherever a command takes a bundle id, it accepts that file name too.
 
 | Group | Commands |
 | --- | --- |
@@ -122,7 +122,7 @@ Environment variables: `MACVM_NAME`, `MACVM_IMAGE`, `MACVM_CPU`, `MACVM_MEMORY`,
 - **SIP is disabled in the guest.** The Cirrus Labs `base` image ships that way, and it is how the image pre-grants TCC permissions. Together with the point below, this makes the VM a test environment and not a sandbox: do not run untrusted apps in it. Behaviour that depends on SIP may differ from a normal Mac.
 - The guest's GUI password stays `admin`, because auto-login depends on it. The guest is reachable only through the host's private NAT network, and SSH password login is off.
 - Permissions are granted to the guest agent's versioned path, so upgrading `tart-guest-agent` inside the VM loses them. `macvm status` shows the state. Do not upgrade it there.
-- macOS may periodically ask to allow direct screen access. Find it with `macvm ui elements` and click Allow.
+- macOS asks now and then whether the guest agent may capture the screen. `setup` and `screenshot` answer this one prompt in the VM. It could still appear between screenshots and take the front until the next `screenshot`.
 - Booting a macOS guest needs the host's login keychain unlocked, which a normal GUI login does. Over SSH to a headless Mac it fails with a security error.
 - The guest can reach the internet and the host's NAT gateway.
 - No Apple ID or iCloud features, audio, or host clipboard. Apple's license limits a host to two concurrent macOS VMs.

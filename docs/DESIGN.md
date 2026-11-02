@@ -74,6 +74,15 @@ The `base` image writes grants into TCC.db at build time, which requires SIP to 
 
 The grants name `tart-guest-agent` by its versioned Cellar path and `sshd-keygen-wrapper`, so upgrading the guest agent inside the VM would lose them.
 
+## Keeping the guest's front window predictable
+
+Commands without `--app` act on the frontmost app, so anything taking the front during a test sends input to the wrong place. Two sources were found by testing on a freshly created VM:
+
+- **The consent dialog** above.
+- **Terminal,** which the base image opens at every login, and System Settings, which sometimes reopens for a reason not established. `start` closes both.
+
+Removing `~/Library/Preferences/ByHost/com.apple.loginwindow.*` must be avoided. A step-by-step experiment on a disposable VM showed that it makes Setup Assistant take over at every login. Turning off automatic update checks did not cause this, but macvm leaves them alone anyway.
+
 ## Separation
 
 - **VM management** (`bin/macvm`): lifecycle, setup, lock.
@@ -112,7 +121,7 @@ Differences:
 - **Added for testing:** refusing disabled, covered and ambiguous targets; selector-based actions in the guest. Chat Computer leaves those decisions to its model, and clicks by coordinates.
 - **Not transferable to Tart:** its transport is vsock on a `VZVirtualMachine` it owns in-process. Tart owns that object, so an outside tool cannot open a vsock device on it. `tart exec` fills the role. This follows from the architecture and was not separately tested.
 - **Not needed:** its setup operates the guest's Settings UI to grant TCC to a signed agent, with SIP on. That suits a consumer app keeping SIP enabled. macvm uses the image's grants, accepting SIP off.
-- **Not adopted:** on-device text recognition to answer the system's consent prompt. The prompt is readable with `ui elements`, and answering it is left to the caller.
+- **Done differently:** Chat Computer answers the system's consent prompt using on-device text recognition. macvm reads it through accessibility, which needs no OCR.
 
 ### tart-skills (MIT) — github.com/jonnyzzz/tart-skills, reviewed at 74345a2
 
@@ -122,7 +131,7 @@ Skills that drive a Tart VM from Linux over SSH, using `tart-remote` and `clicli
 | --- | --- |
 | Detach `tart run` so the VM outlives the caller | Already done, using `setsid` |
 | Guest ignores `tart set --display` on Tahoe and stays at 1024x768 | Confirmed independently; `set-display` uses CoreGraphics, not `displayplacer` |
-| Periodic consent dialog for direct screen access | Documented in the skill and README. Not seen in testing |
+| Consent dialog for direct screen access | Confirmed: on a new VM the first capture raises it, and it takes the front. `setup` makes that first capture and answers it, and `screenshot` answers it if it returns. Only this exact prompt is answered |
 | Host keychain must be unlocked to boot a macOS guest | Documented |
 | The base image has SIP off | Checked, and it corrected this project's documentation |
 | `ControlMaster` to avoid sshd lockouts | Not adopted: that risk comes from repeated password auth, and macvm uses one key with `IdentitiesOnly`. Bursts of calls passed in testing |

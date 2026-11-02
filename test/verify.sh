@@ -127,7 +127,8 @@ screen=$(macvm screen | head -1 | jq -r '.width | floor')
 mcp() { printf '%s\n' "$@" | macvm mcp; }
 call() { printf '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$1" "$2"; }
 macvm activate "$ID" >/dev/null
-mcp "$(call ui_click '{"label":"保存"}')" | jq -e '.result.isError == false' >/dev/null && ok "MCP ui_click" || ng "MCP ui_click"
+echo "      frontmost before MCP: $(macvm frontmost | jq -r .bundleId); windows: $(macvm windows | jq -r .app | sort -u | tr '\n' ' ')"
+mcp "$(call ui_click '{"label":"保存"}')" | jq -e '.result.isError == false' >/dev/null && ok "MCP ui_click" || { ng "MCP ui_click" "$(mcp "$(call ui_click '{"label":"保存"}')" | cut -c1-200) frontmost=$(macvm frontmost | jq -r .bundleId)"; macvm screenshot -o "${TMPDIR:-/tmp}/macvm-mcp-fail.png" >/dev/null; }
 mcp "$(call ui_type '{"id":"input","text":"--via mcp","replace":true}')" | jq -e '.result.content[0].text | fromjson | .value == "--via mcp"' >/dev/null && ok "MCP ui_type with text like an option" || ng "MCP ui_type with text like an option"
 mcp "$(call ui_click '{"label":"Disabled"}')" | jq -e '.result.isError == true and (.result.content[0].text | contains("disabled"))' >/dev/null && ok "MCP reports errors" || ng "MCP reports errors"
 mcp "$(call screenshot '{}')" | jq -e '.result.content[0].type == "image" and (.result.content[0].data | length) > 1000' >/dev/null && ok "MCP screenshot returns an image" || ng "MCP screenshot"
@@ -163,6 +164,17 @@ rm -rf "$res"
 rm -f "$shot"
 check "clean" macvm clean "$ID"
 if macvm ssh "test -e ~/macvm/apps/$ID"; then ng "clean removed the app"; else ok "clean removed the app"; fi
+
+# An executable with no bundle, as `swift build` produces: no bundle id to find it by.
+cp "$app/Contents/MacOS/MacvmTest" "$work/PlainApp"
+check "install a bundle-less GUI executable" macvm install "$work/PlainApp"
+check "launch it" macvm launch PlainApp
+check "wait-window finds it by file name" macvm wait-window PlainApp 15
+macvm app-status PlainApp | jq -e '.running' >/dev/null && ok "app-status finds it" || ng "app-status finds it"
+check "ui click --app finds it" macvm ui click --app PlainApp --label "保存"
+macvm logs PlainApp --stdout | grep saved >/dev/null && ok "the click reached it" || ng "the click reached it"
+check "quit it" macvm quit PlainApp
+check "clean it" macvm clean PlainApp
 
 # Plain executable.
 printf '#!/bin/sh\necho hi-from-binary\n' > "$work/mybin"; chmod +x "$work/mybin"

@@ -170,6 +170,16 @@ cmd_boot() {
   wait_until 180 "the guest agent" gui /usr/bin/true || exit 1
 }
 
+# The base image opens Terminal at every login, and System Settings may reopen too. They
+# are closed so that nothing but the app under test is around. Do not "fix" this by
+# deleting ByHost/com.apple.loginwindow.*: that makes Setup Assistant take over at login.
+close_login_apps() {
+  local app
+  for app in com.apple.Terminal com.apple.systempreferences; do
+    gui /usr/bin/osascript -e "if application id \"$app\" is running then tell application id \"$app\" to quit" >/dev/null 2>&1 || true
+  done
+}
+
 gui_ready() {
   [ "$(gui /bin/sh -c 'pgrep -xq Finder && pgrep -xq Dock && echo yes')" = yes ]
 }
@@ -180,6 +190,7 @@ cmd_start() {
   [ -f "$SSH_KEY" ] || die "the SSH key is missing; run: macvm setup"
   wait_until 60 "SSH" gssh true || die "SSH is not reachable; run: macvm setup"
   push_helper
+  close_login_apps
   info "VM '$VM' is running at $(vm_ip)"
 }
 
@@ -346,12 +357,17 @@ cmd_setup() {
   wait_until 60 "SSH" gssh true || exit 1
 
   push_helper
+  close_login_apps
 
-  info "tuning the guest (no sleep, no indexing, no automatic updates)..."
-  guest_shell 'sudo -n pmset -a sleep 0 displaysleep 0 disksleep 0; sudo -n mdutil -a -i off >/dev/null; sudo -n softwareupdate --schedule off >/dev/null 2>&1; defaults write com.apple.Terminal NSQuitAlwaysKeepsWindows -bool false; osascript -e "tell application id \"com.apple.Terminal\" to quit" >/dev/null 2>&1; mkdir -p ~/macvm/apps ~/macvm/runs ~/macvm/bin; true'
-
+  info "tuning the guest (no sleep, no indexing)..."
+  guest_shell 'sudo -n pmset -a sleep 0 displaysleep 0 disksleep 0; sudo -n mdutil -a -i off >/dev/null; mkdir -p ~/macvm/apps ~/macvm/runs ~/macvm/bin; true' 2>/dev/null
   local w=${VM_DISPLAY%x*} h=${VM_DISPLAY#*x}
   helper set-display "$w" "$h" >/dev/null || err "warning: could not set the guest display to $VM_DISPLAY"
+
+  # Take the first capture now, so its consent dialog does not appear during a test.
+  gui /usr/sbin/screencapture -x /tmp/macvm-setup.png >/dev/null 2>&1
+  answer_capture_prompt 20 || info "no screen capture prompt appeared"
+  guest_shell 'rm -f /tmp/macvm-setup.png'
 
   local perms
   perms=$(helper permissions) || die "helper failed in the VM"

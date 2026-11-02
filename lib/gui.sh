@@ -40,6 +40,22 @@ cmd_wait_window() {
   poll_until "$timeout" "a window of $id" windows "$id"
 }
 
+# A capture can raise macOS's consent dialog shortly afterwards. Left open, it holds
+# the front and later commands go to the wrong app. Checks ATTEMPTS times.
+answer_capture_prompt() {
+  local attempts=$1 i=0
+  while [ "$i" -lt "$attempts" ]; do
+    if helper allow-capture-prompt 2>/dev/null | jq -e '.allowed == true' >/dev/null; then
+      info "answered the screen capture prompt"
+      sleep 0.5
+      return 0
+    fi
+    i=$((i + 1))
+    [ "$i" -lt "$attempts" ] && sleep 0.5
+  done
+  return 1
+}
+
 cmd_screenshot() {
   local out="" raw=no window="" region=""
   while [ $# -gt 0 ]; do
@@ -57,7 +73,9 @@ cmd_screenshot() {
   local remote="/tmp/macvm-shot-$$.png" flags=(-x -t png)
   [ -n "$window" ] && flags+=(-l "$window")
   [ -n "$region" ] && flags+=(-R "$region")
+  answer_capture_prompt 1 || true
   gui /usr/sbin/screencapture "${flags[@]}" "$remote" || die "screencapture failed in the VM"
+  answer_capture_prompt 2
   scp -q "${SSH_OPTS[@]}" "$GUEST_USER@[$(vm_ip)]:$remote" "$out" || die "could not download the screenshot"
   gssh "rm -f $(sq "$remote")" || true
   # Scale full-screen captures to points, so image coordinates equal click coordinates.

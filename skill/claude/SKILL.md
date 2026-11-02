@@ -81,7 +81,7 @@ One session drives the GUI at a time. GUI commands take the lock automatically a
 | App will not launch | `macvm logs ID --stderr`, `macvm crashes ID`, then retry `install --adhoc-sign`. Debug-signed apps with restricted entitlements or a device-bound provisioning profile need a re-sign, which may remove those capabilities: report that. |
 | Stale or hung app | `macvm quit ID --force` |
 | Input does nothing | `macvm frontmost`, `macvm activate ID`, then `macvm ui elements` and a screenshot to look for a blocking dialog. |
-| Screen capture prompt | macOS may periodically ask to allow direct screen access. Find it with `macvm ui elements`, click Allow. |
+| Screen capture prompt | `macvm screenshot` answers it. If it took the front between screenshots, run `macvm screenshot` once. |
 | VM will not boot with a security error | The host login keychain is locked (no GUI login on the host). Report it to the user. |
 
 Report anything not verified as unverified. Limits: no audio, no host clipboard, no iCloud or Apple ID features, and hardware such as cameras is unavailable.

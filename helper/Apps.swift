@@ -5,10 +5,22 @@ import ApplicationServices
 
 // MARK: - Apps and windows
 
-func runningApp(_ bundleId: String) -> NSRunningApplication {
-    guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first else {
-        die("app not running: \(bundleId)", code: 3)
-    }
+/// An app ID is a bundle id, or the file name of an executable with no bundle, such as
+/// what `swift build` produces.
+func findApp(_ id: String) -> NSRunningApplication? {
+    NSRunningApplication.runningApplications(withBundleIdentifier: id).first
+        ?? NSWorkspace.shared.runningApplications.first {
+            $0.bundleIdentifier == nil && $0.executableURL?.lastPathComponent == id
+        }
+}
+
+func matches(_ app: NSRunningApplication?, id: String) -> Bool {
+    guard let app else { return false }
+    return app.bundleIdentifier == id || (app.bundleIdentifier == nil && app.executableURL?.lastPathComponent == id)
+}
+
+func runningApp(_ id: String) -> NSRunningApplication {
+    guard let app = findApp(id) else { die("app not running: \(id)", code: 3) }
     return app
 }
 
@@ -33,7 +45,7 @@ func listWindows(bundleId: String?) {
         guard (window[kCGWindowLayer as String] as? Int) == 0,
               let pid = window[kCGWindowOwnerPID as String] as? Int32 else { continue }
         let app = NSRunningApplication(processIdentifier: pid)
-        if let bundleId, app?.bundleIdentifier != bundleId { continue }
+        if let bundleId, !matches(app, id: bundleId) { continue }
         let bounds = window[kCGWindowBounds as String] as? [String: Double] ?? [:]
         emit([
             "windowId": window[kCGWindowNumber as String] as? Int ?? 0,
@@ -67,9 +79,9 @@ func activate(bundleId: String, title: String?) {
         if !raised { die("no window with title containing '\(title)'", code: 3) }
     }
     // Activation is asynchronous; report what actually happened rather than assume.
-    for _ in 0..<30 where NSWorkspace.shared.frontmostApplication?.bundleIdentifier != bundleId { pause(100) }
+    for _ in 0..<30 where !matches(NSWorkspace.shared.frontmostApplication, id: bundleId) { pause(100) }
     let front = NSWorkspace.shared.frontmostApplication
-    if front?.bundleIdentifier != bundleId {
+    if !matches(front, id: bundleId) {
         die("activation did not take effect; frontmost is \(front?.bundleIdentifier ?? "none")", code: 1)
     }
     emit(describe(front))

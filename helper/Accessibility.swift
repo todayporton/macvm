@@ -363,6 +363,37 @@ func coveringElement(at point: CGPoint, target: AXUIElement) -> String? {
     return "\(owner) \(node.shortRole) \"\(node.label ?? "")\""
 }
 
+// MARK: - The screen capture prompt
+
+/// macOS asks now and then whether the guest agent may capture the screen directly,
+/// and the dialog takes the front. macvm's own captures raise it, so macvm answers it.
+/// It matches this exact prompt and presses nothing else.
+func allowCapturePrompt() {
+    let id = "com.apple.UserNotificationCenter"
+    guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first else {
+        emit(["prompt": false])
+        return
+    }
+    let root = axApp(app)
+    var text = ""
+    var allow: AXUIElement?
+    let walker = Walker(includeOffscreen: true)
+    for window in children(of: root, attribute: kAXWindowsAttribute) {
+        walker.walk(window, path: "", depth: 0) { node in
+            if node.role == "AXStaticText", let value = node.value { text += value + " " }
+            if node.role == "AXButton", node.label == "Allow" { allow = node.element }
+            return true
+        }
+    }
+    guard text.contains("tart-guest-agent"), text.contains("private window picker"), let allow else {
+        emit(["prompt": false])
+        return
+    }
+    let result = AXUIElementPerformAction(allow, kAXPressAction as CFString)
+    guard result == .success else { die("could not answer the screen capture prompt (\(result.rawValue))", code: 1) }
+    emit(["prompt": true, "allowed": true])
+}
+
 // MARK: - Commands
 
 func report(_ node: Node, extra: [String: Any] = [:]) {
@@ -579,7 +610,7 @@ func uiWait(_ args: Arguments) {
     let deadline = Date().addingTimeInterval(Double(args.int("timeout", default: 20)))
     let gone = args.flags.contains("gone")
     repeat {
-        if NSRunningApplication.runningApplications(withBundleIdentifier: args.options["app"] ?? "").isEmpty && args.options["app"] != nil {
+        if let id = args.options["app"], findApp(id) == nil {
             if gone { emit(["gone": true]); return }
         } else {
             let nodes = findNodes(args, selector)

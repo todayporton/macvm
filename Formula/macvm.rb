@@ -8,7 +8,6 @@ class Macvm < Formula
 
   depends_on :macos
   depends_on arch: :arm64
-  depends_on xcode: :build
 
   def install
     system "make", "install", "PREFIX=#{prefix}"

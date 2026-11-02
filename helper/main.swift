@@ -116,7 +116,7 @@ func main() {
         }
     case "app-status":
         guard let bundleId = rest.first else { die("app-status needs a bundle id") }
-        let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId).first
+        let app = findApp(bundleId)
         var out = describe(app)
         out["bundleId"] = bundleId
         out["running"] = app != nil
@@ -165,6 +165,8 @@ func main() {
     case "type":
         guard rest.count == 1 else { die("type needs exactly one text argument") }
         typeText(rest[0])
+    case "allow-capture-prompt":
+        allowCapturePrompt()
     case "ui":
         uiCommand(rest)
     default:
