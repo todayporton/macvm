@@ -66,6 +66,12 @@ Coordinates are global points. `ui` frames (`[x, y, width, height]`) and full-sc
 
 If an unexpected app is frontmost, `ui elements` lists its controls too, so a system dialog can be read and answered the same way.
 
+## Password prompts in the VM
+
+The guest's user is `admin` and its password is `admin`. This is the base image's public default, not a secret, so you may enter it without asking when a test reaches a password prompt inside the VM, such as "Open Anyway" for a self-signed app, an installer or an admin authorization dialog. Enter it only through `macvm` commands, and never enter it, or any other password, on the host. Do not change it: auto-login depends on it.
+
+Read the dialog with `macvm ui elements`, then use `ui type` and `ui click`. If those cannot reach a system authentication dialog, fall back to `macvm screenshot`, `macvm click` and `macvm type`. If the password still does not get through, report that the step could not be automated.
+
 ## Locking
 
 One session drives the GUI at a time. GUI commands take the lock automatically and renew it on each use. It is released by `macvm unlock`, by `macvm stop`, after 15 idle minutes, or when the owning process dies. Exit code 75 means another session held it for the whole 5-minute wait: tell the user, or retry later. Use `macvm unlock --force` only when the holder is known to be gone. Do not stop the VM or force-unlock while another session's lock is live.
