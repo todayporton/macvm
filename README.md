@@ -25,19 +25,19 @@ Tart is free for personal computers under its [Fair Source license](https://tart
 ## Install
 
 ```bash
-brew install poTKC/tap/macvm
+brew install todayporton/tap/macvm
 macvm setup
 ```
 
 Or from source, into `~/.local` (set `PREFIX=...` for elsewhere):
 
 ```bash
-git clone https://github.com/poTKC/macvm.git && cd macvm
+git clone https://github.com/todayporton/macvm.git && cd macvm
 ./install.sh
 macvm setup
 ```
 
-`Formula/macvm.rb` is the template for the formula in [poTKC/homebrew-tap](https://github.com/poTKC/homebrew-tap).
+`Formula/macvm.rb` is the template for the formula in [todayporton/homebrew-tap](https://github.com/todayporton/homebrew-tap).
 
 `macvm setup` is safe to re-run, and does the following:
 

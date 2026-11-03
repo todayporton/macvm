@@ -1,8 +1,8 @@
 # Template for a Homebrew tap. Set `url` and `sha256` for each release.
 class Macvm < Formula
   desc "Run macOS GUI tests in a shared headless Tart VM, leaving the host GUI alone"
-  homepage "https://github.com/poTKC/macvm"
-  url "https://github.com/poTKC/macvm/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/todayporton/macvm"
+  url "https://github.com/todayporton/macvm/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "REPLACE_AT_RELEASE"
   license "MIT"
 

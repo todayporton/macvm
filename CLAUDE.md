@@ -9,7 +9,7 @@ CLI for running macOS GUI tests in one shared headless Tart VM. See `README.md` 
 - `helper/*.swift`: the program that runs inside the guest
 - `skill/claude/SKILL.md`: the Claude Code skill
 - `test/verify.sh`: end-to-end test against the real VM
-- `Formula/macvm.rb`: template for the formula in `poTKC/homebrew-tap`
+- `Formula/macvm.rb`: template for the formula in `todayporton/homebrew-tap`
 
 ## Develop and verify
 
@@ -41,6 +41,6 @@ Changes reach `brew upgrade` only after a release. Commit, push, tag and create 
 
 1. Update `VERSION` in `bin/macvm`, then commit and push to `main`.
 2. Tag `vX.Y.Z`, push the tag, and run `gh release create`.
-3. Get the checksum: `curl -fsSL https://github.com/poTKC/macvm/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256`
-4. Update `url` and `sha256` in `Formula/macvm.rb` of `poTKC/homebrew-tap`, and push. Run `brew audit --strict poTKC/tap/macvm`.
+3. Get the checksum: `curl -fsSL https://github.com/todayporton/macvm/archive/refs/tags/vX.Y.Z.tar.gz | shasum -a 256`
+4. Update `url` and `sha256` in `Formula/macvm.rb` of `todayporton/homebrew-tap`, and push. Run `brew audit --strict todayporton/tap/macvm`.
 5. Run `brew update && brew upgrade macvm`, and `macvm integrate claude` if the skill changed. The next `macvm start` updates the helper in the VM.
